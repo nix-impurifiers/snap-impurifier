@@ -151,6 +151,8 @@ in
           ExecStart = "/usr/lib/snapd/snapd";
           Type = "notify";
           NotifyAccess = "all";
+          # Native snapd uses exit 42 for idle socket-activated standby.
+          SuccessExitStatus = [ 42 ];
         };
       };
     };
@@ -158,7 +160,8 @@ in
       import shlex
       start_all()
       machine.wait_for_unit("multi-user.target")
-      machine.wait_for_unit("snapd.service")
+      machine.wait_for_unit("snapd.socket")
+      machine.succeed("/usr/bin/snap version")
       machine.succeed("cp ${hardware} /home/consumer/hardware.snap; cp ${net} /home/consumer/net.snap; cp ${offline} /home/consumer/offline.snap; cp ${update} /home/consumer/update.snap")
       machine.succeed("/usr/bin/snap version")
       machine.succeed("timeout 60 /usr/bin/snap wait system seed.loaded")
