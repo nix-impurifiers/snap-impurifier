@@ -4,6 +4,7 @@
   impurifier,
   coreSrc,
   tools,
+  bundled ? false,
 }:
 let
   app = pkgs.writeShellScriptBin "snap-app" "echo nix-in-snap" // {
@@ -14,11 +15,20 @@ let
     pname = "snap-app";
     version = "2";
   };
-  net = impurifier.makeNetSnap { pkg = app; };
-  offline = impurifier.makeOfflineSnap { pkg = app; };
-  update = impurifier.makeOfflineSnap { pkg = app2; };
+  staticNix = import (coreSrc + "/tests/static-nix.nix") { inherit pkgs; };
+  bundleArgs = pkgs.lib.optionalAttrs bundled {
+    bundledNixStore = "${staticNix}/bin/nix-store";
+    bundledNixNotices = [ "${pkgs.nix.src}/COPYING" ];
+  };
+  builder = impurifier // {
+    makeNetSnap = args: impurifier.makeNetSnap (args // bundleArgs);
+    makeOfflineSnap = args: impurifier.makeOfflineSnap (args // bundleArgs);
+  };
+  net = builder.makeNetSnap { pkg = app; };
+  offline = builder.makeOfflineSnap { pkg = app; };
+  update = builder.makeOfflineSnap { pkg = app2; };
   fixture = import (coreSrc + "/tests/hardware-fixture.nix") { inherit pkgs; };
-  hardware = impurifier.makeOfflineSnap {
+  hardware = builder.makeOfflineSnap {
     pkg = fixture.tool;
     inherit (fixture) hardware;
   };
@@ -30,28 +40,36 @@ let
     url = "https://api.snapcraft.io/api/v1/snaps/download/EISPgh06mRh1vordZY9OZ34QHdd7OrdR_5.snap";
     hash = "sha256-A9Ci62LhuIYeVX94dfLXT1n1bImsC0d1++bQDEZfyEs=";
   };
-  marker = pkgs.runCommand "native-marker.snap" { nativeBuildInputs = [ pkgs.squashfsTools ]; } ''
-    mkdir -p root/meta root/bin
-    printf '#!/bin/sh\necho native-snap\n' > root/bin/marker
-    chmod 755 root/bin/marker
-    cat > root/meta/snap.yaml <<'YAML'
-    name: native-marker
-    version: '1'
-    summary: Native transaction fixture
-    description: A native Snap installed and launched by unmodified snapd.
-    grade: devel
-    confinement: classic
-    base: bare
-    apps:
-      native-marker:
-        command: bin/marker
-    YAML
-    env -u SOURCE_DATE_EPOCH mksquashfs root $out -noappend -all-root -mkfs-time 1 -all-time 1 -comp xz -processors 1
-  '';
+  nativePayload =
+    version:
+    pkgs.runCommand "native-snap-payload-${version}"
+      {
+        nativeBuildInputs = [ pkgs.pkgsStatic.stdenv.cc ];
+      }
+      ''
+        mkdir -p $out/bin
+        cat > proof.c <<'C'
+        #include <stdio.h>
+        int main(void) { puts("native-snap-${version}"); return 0; }
+        C
+        $CC -static proof.c -o $out/bin/marker
+      '';
+  marker = impurifier.makeNativeSnap {
+    name = "native-marker";
+    version = "1";
+    payload = nativePayload "1";
+    program = "marker";
+  };
+  marker2 = impurifier.makeNativeSnap {
+    name = "native-marker";
+    version = "2";
+    payload = nativePayload "2";
+    program = "marker";
+  };
 in
 {
   native-vm = pkgs.testers.runNixOSTest {
-    name = "snap-native-contract";
+    name = "snap-native-contract${pkgs.lib.optionalString bundled "-bundled"}";
     requiredFeatures = {
       kvm = false;
       devnet = false;
@@ -70,6 +88,21 @@ in
         pkgs.udev
       ];
       nix.settings.substituters = lib.mkForce [ ];
+      environment.etc = lib.optionalAttrs bundled {
+        "impurifier-bundle-test".text = "bundled";
+      };
+      system.activationScripts.bundle-test = lib.mkIf bundled {
+        deps = [
+          "users"
+          "native-snapd"
+        ];
+        text = ''
+          printf '#!${pkgs.runtimeShell}\necho incompatible-client\n' > /usr/bin/nix-store
+          chmod 755 /usr/bin/nix-store
+          printf 'export PATH=/usr/bin:${pkgs.systemd}/bin:${impurifier.package}/bin\n' > /home/consumer/.bash_profile
+          chown consumer:users /home/consumer/.bash_profile
+        '';
+      };
       boot.supportedFilesystems = [ "squashfs" ];
       users.users.consumer.isNormalUser = true;
       system.activationScripts.native-snapd.deps = [ "etc" ];
@@ -135,13 +168,22 @@ in
       machine.succeed("/usr/bin/snap list")
       machine.succeed("loginctl enable-linger consumer")
       machine.wait_for_unit("user@1000.service")
-      assert machine.succeed("su - consumer -c 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemd-run --user --scope --quiet /usr/bin/snap run native-marker'").strip() == "native-snap"
+      assert machine.succeed("su - consumer -c 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemd-run --user --scope --quiet /usr/bin/snap run native-marker'").strip() == "native-snap-1"
+      machine.succeed("mkdir -p /srv/native/bin; cp /snap/native-marker/current/bin/marker /srv/native/bin/marker")
+      assert machine.succeed("chroot /srv/native /bin/marker").strip() == "native-snap-1"
+      machine.succeed("test ! -e /srv/native/nix; test ! -e /snap/native-marker/current/launch.py")
+      machine.succeed("/usr/bin/snap install --dangerous --classic ${marker2}")
+      assert machine.succeed("su - consumer -c 'XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemd-run --user --scope --quiet /usr/bin/snap run native-marker'").strip() == "native-snap-2"
       machine.succeed("/usr/bin/snap remove --purge native-marker")
+      machine.succeed("test ! -e /snap/native-marker/current")
       machine.succeed("mkdir -p /root/drivers /usr/lib; cp ${fixture.driver "1"}/usr/lib/libimpurifier-driver.so.1 /root/drivers/1.so; cp ${fixture.driver "2"}/usr/lib/libimpurifier-driver.so.1 /root/drivers/2.so")
       def user_command(command):
           return "su - consumer -c " + shlex.quote("XDG_RUNTIME_DIR=/run/user/1000 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus systemd-run --user --scope --quiet " + command)
       def run_app():
           return machine.succeed(user_command("/usr/bin/snap run snap-app")).strip()
+      ${pkgs.lib.optionalString bundled ''
+        assert machine.succeed("su - consumer -c 'nix-store --version'").strip() == "incompatible-client"
+      ''}
       machine.succeed("/usr/bin/snap set system refresh.retain=3")
       machine.succeed("nix-store --gc; test ! -e ${builtins.unsafeDiscardStringContext (toString app)}")
       machine.succeed("/usr/bin/snap install --dangerous --classic /home/consumer/net.snap")

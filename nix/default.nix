@@ -41,6 +41,48 @@ let
       esac
     '';
   };
+  makeNativeSnap =
+    {
+      name,
+      version,
+      payload,
+      program,
+      architecture ? "amd64",
+    }:
+    assert lib.assertMsg (builtins.match "[a-z][a-z0-9-]{0,39}" name != null) "invalid snap name";
+    assert lib.assertMsg (
+      builtins.match "[A-Za-z0-9_+-][A-Za-z0-9_.+-]*" program != null
+    ) "invalid native program";
+    assert lib.assertMsg (lib.elem architecture [
+      "amd64"
+      "arm64"
+      "armhf"
+      "i386"
+      "ppc64el"
+      "s390x"
+      "riscv64"
+    ]) "invalid snap architecture";
+    pkgs.runCommand "${name}-native.snap" { nativeBuildInputs = [ pkgs.squashfsTools ]; } ''
+      mkdir -p root/meta
+      cp -r ${payload}/. root/
+      chmod -R u+w root
+      test -x root/bin/${program}
+      cat > root/meta/snap.yaml <<'YAML'
+      name: ${name}
+      version: ${builtins.toJSON version}
+      summary: Prepared native application
+      description: A producer-prepared application with native Snap ownership.
+      architectures: [${architecture}]
+      grade: devel
+      confinement: classic
+      base: bare
+      apps:
+        ${name}:
+          command: bin/${program}
+      YAML
+      ${tools.package}/usr/bin/snap pack root . --filename projection.snap
+      mv projection.snap $out
+    '';
   makeSnap =
     {
       pkg,
@@ -48,6 +90,8 @@ let
       program ? pkg.meta.mainProgram or pkg.pname,
       offline ? false,
       hardware ? null,
+      bundledNixStore ? null,
+      bundledNixNotices ? [ ],
     }:
     assert lib.assertMsg (builtins.match "[a-z][a-z0-9-]{0,39}" name != null) "invalid snap name";
     assert lib.assertMsg (
@@ -59,6 +103,23 @@ let
     assert lib.assertMsg (
       hardware == null || lib.elem program (hardware.programs or [ ])
     ) "hardware must select this program";
+    let
+      appSdk =
+        if bundledNixStore == null then
+          sdk
+        else
+          pkgs.linkFarm "snap-python-sdk" [
+            {
+              name = "python";
+              path = pkgs.python3;
+            }
+            {
+              name = "register-root";
+              path = registerRoot;
+            }
+          ];
+      bundle = core.makeRuntimeTree { inherit bundledNixStore bundledNixNotices; };
+    in
     pkgs.runCommand "${name}-${pkg.version}.snap"
       {
         nativeBuildInputs = [ pkgs.squashfsTools ];
@@ -80,13 +141,18 @@ let
             }
           )
         } root/application.json
-        ln -s ${sdk} root/sdk-root
+        ${lib.optionalString (bundledNixStore != null) ''
+          cp ${bundle}/usr/lib/snap-impurifier/nix-store root/nix-store
+          mkdir -p root/share/licenses/bundled-nix
+          cp -r ${bundle}/usr/share/licenses/snap-impurifier/bundled-nix/. root/share/licenses/bundled-nix/
+        ''}
+        ln -s ${appSdk} root/sdk-root
         ln -s ${pkg} root/nix-root
         printf '#!${pkgs.python3}/bin/python3\nimport runpy\nfrom pathlib import Path\nrunpy.run_path(str(Path(__file__).resolve().parent.parent / "launch.py"), run_name="__main__")\n' > root/bin/impurifier-launch
         chmod 755 root/bin/impurifier-launch
         ${lib.optionalString offline ''
           cp -r ${core.offlineCache pkg} root/cache
-          cp -r ${core.offlineCache sdk} root/sdk-cache
+          cp -r ${core.offlineCache appSdk} root/sdk-cache
         ''}
         cat > root/meta/snap.yaml <<'YAML'
         name: ${name}
@@ -111,6 +177,7 @@ in
     package
     sdk
     makeSnap
+    makeNativeSnap
     ;
   makeNetSnap = args: makeSnap (args // { offline = false; });
   makeOfflineSnap = args: makeSnap (args // { offline = true; });

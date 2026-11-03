@@ -62,3 +62,24 @@ cache preparation, offline recovery, unchanged package hashes, revision
 updates/revert/retention/removal, host-library replacement and Nix GC. Strict
 confinement, AppArmor enforcement, services, Snap Store publication, snapshot
 restore and other architectures require additional coverage.
+
+## Prepared native payloads and bundled clients
+
+`makeNativeSnap { name; version; payload; program; architecture ? "amd64"; }`
+packs a complete prepared application tree with `bin/<program>`. It adds no
+engine, Nix SDK or activation. The producer supplies target-compatible files;
+this does not relocate binaries. Native snaps retain classic confinement and
+`bare` base requirements. The actual snapd VM executes a static native payload,
+upgrades it and removes it, and separately executes its installed binary in an
+isolated root without `/nix`. This is not a complete Nix-free host boot test.
+
+Nix-backed constructors accept `bundledNixStore` and `bundledNixNotices` (a list
+of upstream notice files). Supply a static ELF client. The app carries that
+client privately and omits the SDK CLI. Launch prefers a compatible external
+client, then the supplied client; explicit `IMPURIFIER_NIX_STORE` disables
+fallback. Selection happens before registration or hardware capture. The
+trusted host preparation helper still uses host tools and never executes the
+application-owned client as root. This requires an existing Nix store, daemon
+and initial SDK preparation; it is not a Nix installer. A separate bundled VM
+repeats the revision, retention, hardware and GC lifecycle with an incompatible
+external candidate.
